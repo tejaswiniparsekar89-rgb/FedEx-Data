@@ -5,14 +5,13 @@ import pandas as pd
 import streamlit as st
 
 APP_TITLE = "FedEx report automation"
-PHASE = "Phase 1: Shipment Data + Criteria"
+PHASE = "Phase 1: Shipment Data + Criteria (+ LOC test data pivots helper)"
 
-# Minimum columns needed from the raw export to compute new columns.
 REQUIRED_RAW_COLUMNS = [
-    "Carrier Name",              # for LOC vlookup
-    "Order Number",              # for Network (first 3 chars)
-    "Active Equipment ID",       # for Trailer rule
-    "Historical Equipment ID",   # for Trailer rule
+    "Carrier Name",
+    "Order Number",
+    "Active Equipment ID",
+    "Historical Equipment ID",
 ]
 
 # ---------- Helpers ----------
@@ -45,46 +44,125 @@ def validate_columns(df, needed, label):
         return f"{label} is missing required column(s): {', '.join(missing)}"
     return None
 
-def build_workbook(raw_df: pd.DataFrame, criteria_df: pd.DataFrame) -> bytes:
+def fill_loc_test_data(loc_test_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    LOC test data sheet structure:
+      - A:E contains main mapping table:
+        A Carrier Name, B LOC, C TRUE, D FALSE, E Grand Total
+      - I:N contains region sub tables where I & J are populated and K:N must be filled:
+        I Carrier Name, J LOC, K Tracked, L Not Tracked, M Grand Total, N Tracked%
+    This function matches (Carrier Name, LOC) from I:J to A:B and fills K:N.
+    """
+    df = loc_test_df.copy()
+
+    # Expect columns by position (since your sheet is structured like Excel columns)
+    # But we’ll also support cases where headers are present.
+    # If headers are present and not exactly as expected, we’ll still use positions.
+
+    # --- Build base map from A:E (0..4) ---
+    if df.shape[1] < 14:
+        # Need at least up to column N (index 13)
+        raise ValueError("LOC test data sheet does not have enough columns (needs up to column N).")
+
+    base = df.iloc[:, 0:5].copy()
+    base.columns = ["Carrier Name", "LOC", "TRUE", "FALSE", "Grand Total"]
+
+    # Clean keys for matching
+    base["Carrier Name_key"] = base["Carrier Name"].astype(str).str.strip().str.upper()
+    base["LOC_key"] = base["LOC"].astype(str).str.strip().str.upper()
+
+    # Keep only rows that look like real data
+    base = base[
+        base["Carrier Name"].notna()
+        & base["LOC"].notna()
+        & (base["Carrier Name"].astype(str).str.strip() != "")
+        & (base["LOC"].astype(str).str.strip() != "")
+    ].copy()
+
+    # If TRUE/FALSE/Grand Total are empty strings, coerce safely to numeric
+    for col in ["TRUE", "FALSE", "Grand Total"]:
+        base[col] = pd.to_numeric(base[col], errors="coerce")
+
+    base_map = base[["Carrier Name_key", "LOC_key", "TRUE", "FALSE", "Grand Total"]].drop_duplicates()
+
+    # --- Subtable keys from I:J (8..9) ---
+    sub = df.iloc[:, 8:10].copy()
+    sub.columns = ["Carrier Name_sub", "LOC_sub"]
+    sub["Carrier Name_key"] = sub["Carrier Name_sub"].astype(str).str.strip().str.upper()
+    sub["LOC_key"] = sub["LOC_sub"].astype(str).str.strip().str.upper()
+
+    # Identify rows where subtable has both keys
+    valid_mask = (
+        sub["Carrier Name_sub"].notna()
+        & sub["LOC_sub"].notna()
+        & (sub["Carrier Name_sub"].astype(str).str.strip() != "")
+        & (sub["LOC_sub"].astype(str).str.strip() != "")
+    )
+
+    # Merge to get TRUE/FALSE/Total
+    merged = sub.loc[valid_mask, ["Carrier Name_key", "LOC_key"]].merge(
+        base_map,
+        on=["Carrier Name_key", "LOC_key"],
+        how="left"
+    )
+
+    # Write into K:L:M:N (10..13)
+    # Default blanks if no match
+    df.iloc[:, 10] = df.iloc[:, 10]  # ensure exists
+    df.iloc[:, 11] = df.iloc[:, 11]
+    df.iloc[:, 12] = df.iloc[:, 12]
+    df.iloc[:, 13] = df.iloc[:, 13]
+
+    # Assign matched values back to the same row indexes
+    target_idx = df.index[valid_mask]
+    df.loc[target_idx, df.columns[10]] = merged["TRUE"].values                 # K Tracked
+    df.loc[target_idx, df.columns[11]] = merged["FALSE"].values                # L Not Tracked
+    df.loc[target_idx, df.columns[12]] = merged["Grand Total"].values          # M Grand Total
+
+    # N Tracked% = TRUE / Grand Total (safe)
+    tracked_pct = merged["TRUE"] / merged["Grand Total"]
+    tracked_pct = tracked_pct.replace([pd.NA, pd.NaT, float("inf"), float("-inf")], pd.NA)
+
+    df.loc[target_idx, df.columns[13]] = tracked_pct.values
+
+    return df
+
+def build_workbook(raw_df: pd.DataFrame, criteria_df: pd.DataFrame, loc_test_df: pd.DataFrame | None = None) -> bytes:
     """
     Create the Excel workbook in-memory with:
-      - Sheet 'Shipment Data' as an Excel Table
+      - Sheet 'Shipment Data' as an Excel Table with formulas
       - Sheet 'Criteria' as provided
-      - Formulas in AX (Trailer), AY (Network), AZ (LOC) appended at the end
+      - Optional: Sheet 'LOC test data' filled for K:N using A:E lookup
     """
-    # Copy raw and ensure we create clean new columns at the end.
     out_df = raw_df.copy()
     for col in ["Trailer", "Network", "LOC"]:
         if col in out_df.columns:
             out_df.drop(columns=[col], inplace=True)
 
-    out_df["Trailer"] = ""   # AX
-    out_df["Network"] = ""   # AY
-    out_df["LOC"] = ""       # AZ
+    out_df["Trailer"] = ""
+    out_df["Network"] = ""
+    out_df["LOC"] = ""
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        # Write Criteria (as provided)
+        # Criteria
         criteria_df.to_excel(writer, sheet_name="Criteria", index=False)
 
-        # Write Shipment Data (values first; then convert to a table with formulas)
+        # Shipment Data
         out_df.to_excel(writer, sheet_name="Shipment Data", index=False, startrow=0, startcol=0)
 
         wb = writer.book
         ws = writer.sheets["Shipment Data"]
 
-        # Determine table coordinates (header row at 0, data starts at 1)
         n_rows, n_cols = out_df.shape
         first_row, first_col = 0, 0
-        last_row = n_rows      # inclusive of header row
-        last_col = n_cols - 1  # inclusive
+        last_row = n_rows
+        last_col = n_cols - 1
 
-        # Build table column definitions (headers + formulas for last three)
         cols_meta = []
         for c in out_df.columns[:-3]:
             cols_meta.append({"header": c})
 
-        # Trailer formula (structured refs), per your rules including UNKNOWN/UNKOWN
         trailer_formula = (
             '=IF(OR(LEFT([@[Active Equipment ID]],6)="861861",'
             'LEFT([@[Active Equipment ID]],5)="86355"),'
@@ -97,17 +175,13 @@ def build_workbook(raw_df: pd.DataFrame, criteria_df: pd.DataFrame) -> bytes:
             '"Subco Trailer"))'
         )
 
-        # Network = first 3 of Order Number
         network_formula = '=IFERROR(LEFT([@[Order Number]],3),"")'
-
-        # LOC = VLOOKUP Carrier Name in Criteria!A:D, return 4th col (LOC)
         loc_formula = '=IFERROR(VLOOKUP([@[Carrier Name]],Criteria!$A:$D,4,0),"")'
 
         cols_meta.append({"header": "Trailer", "formula": trailer_formula})
         cols_meta.append({"header": "Network", "formula": network_formula})
         cols_meta.append({"header": "LOC", "formula": loc_formula})
 
-        # ✅ Correct style usage: style must be a string (not a dict)
         ws.add_table(
             first_row,
             first_col,
@@ -124,7 +198,7 @@ def build_workbook(raw_df: pd.DataFrame, criteria_df: pd.DataFrame) -> bytes:
             },
         )
 
-        # Optional: set column widths for readability (best-effort)
+        # Widths (best effort)
         try:
             width_map = {
                 "Carrier Name": 24,
@@ -139,7 +213,16 @@ def build_workbook(raw_df: pd.DataFrame, criteria_df: pd.DataFrame) -> bytes:
             for idx, h in enumerate(headers):
                 ws.set_column(idx, idx, width_map.get(h, 14))
         except Exception:
-            pass  # Non-fatal
+            pass
+
+        # -------- NEW: LOC test data sheet filled --------
+        if loc_test_df is not None:
+            filled_loc_test = fill_loc_test_data(loc_test_df)
+
+            # Write as-is to a dedicated sheet
+            # (If you need to keep original formatting exactly, we’d switch to openpyxl templating,
+            # but for pivot prep this table output usually works fine.)
+            filled_loc_test.to_excel(writer, sheet_name="LOC test data", index=False)
 
     output.seek(0)
     return output.getvalue()
@@ -168,19 +251,34 @@ def main():
             accept_multiple_files=False
         )
 
+    st.markdown("**Optional:**")
+    loc_test_file = st.file_uploader(
+        "Upload LOC test data template (to fill region subtables K:N based on A:E)",
+        type=["csv", "xlsx", "xls"],
+        key="loc_test_upload",
+        accept_multiple_files=False
+    )
+
     if st.button("Generate Excel", type="primary", use_container_width=True):
         try:
-            # Read files
             raw_df, err1 = read_any_table(raw_file)
             criteria_df, err2 = read_any_table(criteria_file, expected_sheet_name="Criteria")
+
+            loc_test_df = None
+            if loc_test_file is not None:
+                loc_test_df, err3 = read_any_table(loc_test_file, expected_sheet_name="LOC test data")
+                if err3:
+                    st.warning(
+                        "LOC test data note: If your workbook doesn't have a 'LOC test data' sheet, "
+                        "the first sheet was used automatically."
+                    )
 
             if err1:
                 st.error(f"Raw file error: {err1}")
                 return
             if err2:
-                # Not fatal: proceed if we could still read a sheet from the file.
                 st.warning(
-                    "Note: If your Criteria workbook does not have a 'Criteria' sheet, "
+                    "Criteria note: If your workbook does not have a 'Criteria' sheet, "
                     "the first sheet was used automatically."
                 )
 
@@ -191,7 +289,6 @@ def main():
                 st.error("Criteria file could not be read.")
                 return
 
-            # Validate raw columns
             err = validate_columns(raw_df, REQUIRED_RAW_COLUMNS, "Raw export")
             if err:
                 st.error(err)
@@ -199,15 +296,13 @@ def main():
                     st.write(list(raw_df.columns))
                 return
 
-            # Optional heads-up if raw has more than A:AW (49 cols)
             if len(raw_df.columns) > 49:
                 st.info(
                     "Heads up: Raw export contains more than 49 columns (A:AW). "
                     "That's okay; Trailer/Network/LOC will still be appended at the end."
                 )
 
-            # Build workbook and offer download
-            excel_bytes = build_workbook(raw_df, criteria_df)
+            excel_bytes = build_workbook(raw_df, criteria_df, loc_test_df=loc_test_df)
 
             st.success("Excel built successfully.")
             st.download_button(
@@ -218,36 +313,9 @@ def main():
                 use_container_width=True
             )
 
-            # Optional previews
-            with st.expander("Preview: Shipment Data (first 20 rows)"):
-                preview = raw_df.head(20).copy()
-                preview["Trailer"] = "«formula»"
-                preview["Network"] = "«formula»"
-                preview["LOC"] = "«VLOOKUP»"
-                st.dataframe(preview, use_container_width=True)
-
-            with st.expander("Preview: Criteria (first 20 rows)"):
-                st.dataframe(criteria_df.head(20), use_container_width=True)
-
         except Exception:
             st.error("Something went wrong while generating the Excel.")
             st.code("".join(traceback.format_exception(*sys.exc_info())))
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
